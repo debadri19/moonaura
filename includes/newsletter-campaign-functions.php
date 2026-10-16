@@ -19,6 +19,7 @@ const NEWSLETTER_UNSUB_TOKEN_TTL = 31536000;
 const NEWSLETTER_CAMPAIGN_LOCK_SECONDS = 600;
 const NEWSLETTER_RECIPIENT_CLAIM_TTL = 900;
 const NEWSLETTER_RECIPIENT_UNKNOWN_ERROR = 'Send outcome unknown; not retried automatically.';
+const NEWSLETTER_RECIPIENT_RESULT_PERSIST_ERROR = 'Could not record the delivery result; sending stopped to avoid duplicate sends. The affected recipient is left unconfirmed and is not retried automatically.';
 
 function newsletter_campaign_valid_statuses(): array
 {
@@ -644,21 +645,31 @@ function newsletter_campaign_mark_recipient(
         return false;
     }
 
-    $stmt = db()->prepare(
-        "UPDATE newsletter_campaign_recipients
-         SET status = ?, error_message = ?, sent_at = ?, claim_token = NULL
-         WHERE campaign_id = ? AND email = ? AND claim_token = ? AND status = 'claimed'"
-    );
-    $stmt->execute([
-        $status,
-        $error !== '' ? mb_substr($error, 0, 240) : null,
-        $status === 'sent' ? date('Y-m-d H:i:s') : null,
-        $campaignId,
-        normalize_email($email),
-        $claimToken,
-    ]);
+    try {
+        $stmt = db()->prepare(
+            "UPDATE newsletter_campaign_recipients
+             SET status = ?, error_message = ?, sent_at = ?, claim_token = NULL
+             WHERE campaign_id = ? AND email = ? AND claim_token = ? AND status = 'claimed'"
+        );
+        $stmt->execute([
+            $status,
+            $error !== '' ? mb_substr($error, 0, 240) : null,
+            $status === 'sent' ? date('Y-m-d H:i:s') : null,
+            $campaignId,
+            normalize_email($email),
+            $claimToken,
+        ]);
 
-    return $stmt->rowCount() === 1;
+        return $stmt->rowCount() === 1;
+    } catch (PDOException $e) {
+        // Do not log the address, claim token, or error text: only a
+        // campaign-scoped diagnostic so failures stay non-sensitive.
+        error_log(
+            'newsletter_campaign_mark_recipient: update failed for campaign '
+            . $campaignId . ' (status ' . $status . ', SQLSTATE ' . $e->getCode() . ')'
+        );
+        return false;
+    }
 }
 
 function newsletter_campaign_recipient_counts(int $campaignId): array
@@ -698,6 +709,7 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
     newsletter_campaign_touch_lock($campaignId);
 
     $processed = 0;
+    $persistFailed = false;
 
     while (true) {
         if ($maxRecipients > 0 && $processed >= $maxRecipients) {
@@ -726,13 +738,17 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
             $fresh = newsletter_admin_get_cached_subscriber($claim['email']);
             $eligibility = newsletter_send_eligibility($claim['email'], $fresh);
             if (!$eligibility['eligible']) {
-                newsletter_campaign_mark_recipient(
+                $recorded = newsletter_campaign_mark_recipient(
                     $campaignId,
                     $claim['email'],
                     'failed',
                     $eligibility['error'] !== '' ? $eligibility['error'] : 'No longer a confirmed subscriber.',
                     $claim['claim_token']
                 );
+                if (!$recorded) {
+                    $persistFailed = true;
+                    break 2;
+                }
                 $processed++;
                 continue;
             }
@@ -743,9 +759,18 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
             ], false);
 
             if ($result['ok']) {
-                newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'sent', '', $claim['claim_token']);
+                $recorded = newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'sent', '', $claim['claim_token']);
             } else {
-                newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'failed', $result['error'], $claim['claim_token']);
+                $recorded = newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'failed', $result['error'], $claim['claim_token']);
+            }
+
+            if (!$recorded) {
+                // The delivery outcome could not be persisted. Stop the run
+                // without finalizing: the claimed row is preserved so the
+                // stale-claim sweep can later move it to `unknown`, and the
+                // message is never automatically resent.
+                $persistFailed = true;
+                break 2;
             }
 
             $processed++;
@@ -755,6 +780,16 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
         if (!$claimedAny) {
             break;
         }
+    }
+
+    if ($persistFailed) {
+        $row = newsletter_campaign_recipient_counts($campaignId);
+        return [
+            'ok'     => false,
+            'error'  => NEWSLETTER_RECIPIENT_RESULT_PERSIST_ERROR,
+            'sent'   => $row['sent'],
+            'failed' => $row['failed'],
+        ];
     }
 
     $row = newsletter_campaign_recipient_counts($campaignId);

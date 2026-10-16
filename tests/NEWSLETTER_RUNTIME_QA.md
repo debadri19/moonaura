@@ -236,8 +236,47 @@ Then run two concurrent sessions against the same `(campaign_id, email)`:
 10. Mid-run state change: there is no UI action that cancels a `sending`
     campaign, so exercise this only by direct SQL if desired. Note the final
     status `UPDATE` in `newsletter_campaign_process()` is not status-guarded.
-11. DB error while recording a result: `newsletter_campaign_mark_recipient()`
-    returns `false` and the row stays `claimed` until it expires to `unknown`.
+11. DB error while recording a result:
+    `newsletter_campaign_mark_recipient()` wraps its `prepare()`/`execute()`
+    in a `PDOException` guard. On a database error it logs a
+    campaign-scoped, non-sensitive diagnostic (no email address, claim
+    token, unsubscribe signature, or other secret) and returns `false`.
+    The conditional `UPDATE` is still scoped to the matching
+    `campaign_id`, normalized email, matching `claim_token`, and
+    `status = 'claimed'`, and only `sent`/`failed` are accepted as
+    result statuses. A return of `false` never clears or rewrites the
+    claim, so the row stays `claimed` until
+    `newsletter_campaign_expire_stale_claims()` eventually moves it to
+    `unknown` (never back to `pending`).
+
+    `newsletter_campaign_process()` treats a `false` result as fatal for
+    the current run: it stops before claiming or sending any further
+    recipient, returns
+    `['ok' => false, 'error' => NEWSLETTER_RECIPIENT_RESULT_PERSIST_ERROR, ...]`
+    with no success/`queued` flag (so the admin UI shows the error rather
+    than a success flash),
+    does not fall back to a `sent`/`failed`/`pending` write, does not
+    resend the ambiguous message, and does not finalize the campaign as
+    sent. The per-recipient claim and campaign lock are left in place so
+    a later resume (still bounded by `NEWSLETTER_CAMPAIGN_LOCK_SECONDS`
+    and `NEWSLETTER_RECIPIENT_CLAIM_TTL`) can continue safely.
+
+    Automated regression: `php tests/newsletter_recipient_result_failure.php`
+    (run only against an isolated `moonaura_qa_*` database). It installs a
+    temporary `BEFORE UPDATE` trigger that raises
+    `SIGNAL SQLSTATE '45000'` for designated synthetic recipients whose
+    result write sets `claim_token = NULL` with `status IN ('sent','failed')`
+    (so the claim write itself is unaffected), and always drops the
+    trigger in a `finally` block. It asserts: (1) the induced exception
+    does not escape and the function returns `false`; (2) the row stays
+    `claimed` with its token intact; (3) a wrong claim token cannot
+    update the row; (4) a subsequent stale-claim sweep yields `unknown`,
+    not `pending`; (5) campaign processing stops with the next recipient
+    still `pending`, the affected row still `claimed`, the campaign still
+    `sending`, and its lock still set; (6) normal `sent` and `failed`
+    result writes still succeed; (7) single-owner claim and
+    `newsletter_campaign_reset_failed_recipients()` retry protections
+    still hold.
 
 Explicitly do not promise exactly-once delivery: SMTP acceptance and the
 database write cannot be a single atomic operation. `unknown` is the correct
