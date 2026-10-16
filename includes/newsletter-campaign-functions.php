@@ -4,7 +4,9 @@
    -------------------------------------------------------------------
    Test email, send now, schedule, history, and send analytics.
    Uses existing send_email() / Brevo SMTP. Open/click tracking is
-   not configured and is never invented.
+   not configured and is never invented. Unsubscribe HMAC uses only
+   NEWSLETTER_UNSUB_SECRET (fail closed). Send-time eligibility
+   re-checks Brevo and skips the recipient if that lookup fails.
 =================================================================== */
 
 require_once __DIR__ . '/newsletter-admin-functions.php';
@@ -14,28 +16,42 @@ const NEWSLETTER_CAMPAIGN_SEND_BATCH = 20;
 const NEWSLETTER_CAMPAIGN_WEB_MAX = 25;
 const NEWSLETTER_CAMPAIGN_PAGE_SIZE = 20;
 const NEWSLETTER_UNSUB_TOKEN_TTL = 31536000;
+const NEWSLETTER_CAMPAIGN_LOCK_SECONDS = 600;
+const NEWSLETTER_RECIPIENT_CLAIM_TTL = 900;
+const NEWSLETTER_RECIPIENT_UNKNOWN_ERROR = 'Send outcome unknown; not retried automatically.';
 
 function newsletter_campaign_valid_statuses(): array
 {
     return ['draft', 'scheduled', 'sending', 'sent', 'failed', 'cancelled'];
 }
 
+function newsletter_unsub_secret_configured(): bool
+{
+    return defined('NEWSLETTER_UNSUB_SECRET')
+        && is_string(NEWSLETTER_UNSUB_SECRET)
+        && strlen(NEWSLETTER_UNSUB_SECRET) >= 16;
+}
+
 function newsletter_campaign_secret(): string
 {
-    if (defined('INVOICE_TOKEN_SECRET') && INVOICE_TOKEN_SECRET !== '') {
-        return (string) INVOICE_TOKEN_SECRET;
+    if (!newsletter_unsub_secret_configured()) {
+        error_log('newsletter_campaign_secret: NEWSLETTER_UNSUB_SECRET is missing or too short');
+        return '';
     }
-    if (defined('ADMIN_2FA_ENCRYPTION_KEY') && ADMIN_2FA_ENCRYPTION_KEY !== '') {
-        return (string) ADMIN_2FA_ENCRYPTION_KEY;
-    }
-    return hash('sha256', SITE_URL . '|newsletter-unsub');
+
+    return (string) NEWSLETTER_UNSUB_SECRET;
 }
 
 function newsletter_unsubscribe_token(string $email): array
 {
     $email = normalize_email($email);
+    $secret = newsletter_campaign_secret();
+    if ($secret === '' || $email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return [];
+    }
+
     $expiresAt = time() + NEWSLETTER_UNSUB_TOKEN_TTL;
-    $signature = hash_hmac('sha256', $email . '|' . $expiresAt, newsletter_campaign_secret());
+    $signature = hash_hmac('sha256', $email . '|' . $expiresAt, $secret);
 
     return ['email' => $email, 'exp' => $expiresAt, 'sig' => $signature];
 }
@@ -43,7 +59,11 @@ function newsletter_unsubscribe_token(string $email): array
 function newsletter_verify_unsubscribe_token(string $email, string $expParam, string $sigParam): bool
 {
     $email = normalize_email($email);
-    if ($email === '' || !ctype_digit($expParam) || $sigParam === '') {
+    $secret = newsletter_campaign_secret();
+    if ($secret === '' || $email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return false;
+    }
+    if (!ctype_digit($expParam) || $sigParam === '') {
         return false;
     }
 
@@ -52,25 +72,82 @@ function newsletter_verify_unsubscribe_token(string $email, string $expParam, st
         return false;
     }
 
-    $expected = hash_hmac('sha256', $email . '|' . $expiresAt, newsletter_campaign_secret());
+    $expected = hash_hmac('sha256', $email . '|' . $expiresAt, $secret);
     return hash_equals($expected, $sigParam);
+}
+
+function newsletter_public_base_url(): string
+{
+    $base = rtrim((string) SITE_URL, '/');
+    if ($base === '' || !newsletter_is_public_https_url($base)) {
+        return '';
+    }
+
+    return $base;
 }
 
 function newsletter_unsubscribe_url(string $email): string
 {
     $token = newsletter_unsubscribe_token($email);
-    return site_url(
-        'newsletter-unsubscribe.php?email=' . rawurlencode($token['email'])
+    $base = newsletter_public_base_url();
+    if ($token === [] || $base === '') {
+        return '';
+    }
+
+    return $base . '/newsletter-unsubscribe.php?email=' . rawurlencode($token['email'])
         . '&exp=' . $token['exp']
-        . '&sig=' . rawurlencode($token['sig'])
-    );
+        . '&sig=' . rawurlencode($token['sig']);
+}
+
+function newsletter_list_unsubscribe_mailto(): string
+{
+    $candidates = [];
+    if (defined('MAIL_REPLY_TO_ADDRESS')) {
+        $candidates[] = (string) MAIL_REPLY_TO_ADDRESS;
+    }
+    if (defined('MAIL_FROM_ADDRESS')) {
+        $candidates[] = (string) MAIL_FROM_ADDRESS;
+    }
+
+    foreach ($candidates as $address) {
+        $address = normalize_email($address);
+        if ($address !== '' && filter_var($address, FILTER_VALIDATE_EMAIL)) {
+            return $address;
+        }
+    }
+
+    return '';
+}
+
+function newsletter_list_unsubscribe_headers(string $email, bool $isTest = false): array
+{
+    if ($isTest) {
+        return [];
+    }
+
+    $parts = [];
+    $url = newsletter_unsubscribe_url($email);
+    if ($url !== '' && newsletter_is_public_https_url($url)) {
+        $parts[] = '<' . $url . '>';
+    }
+
+    $mailto = newsletter_list_unsubscribe_mailto();
+    if ($mailto !== '') {
+        $parts[] = '<mailto:' . $mailto . '?subject=' . rawurlencode('unsubscribe') . '>';
+    }
+
+    if ($parts === []) {
+        return [];
+    }
+
+    return ['List-Unsubscribe' => implode(', ', $parts)];
 }
 
 function newsletter_campaign_cta_html(array $campaign): string
 {
     $text = trim((string) ($campaign['cta_text'] ?? ''));
     $url  = trim((string) ($campaign['cta_url'] ?? ''));
-    if ($text === '' || $url === '') {
+    if ($text === '' || $url === '' || !newsletter_is_public_https_url($url)) {
         return '';
     }
 
@@ -86,11 +163,14 @@ function newsletter_campaign_footer_html(string $unsubscribeUrl, bool $isTest = 
         ? 'This is a test email. Confirmed subscribers were not contacted.'
         : 'You received this because you confirmed a MoonAura Crystals newsletter subscription.';
 
+    $unsubHtml = $unsubscribeUrl !== ''
+        ? '<a href="' . h($unsubscribeUrl) . '" style="color:#5B2E91;">Unsubscribe</a> &middot; '
+        : '';
+
     return '<div style="margin-top:32px;padding-top:16px;border-top:1px solid #ece7f5;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.7;color:#8b8678;text-align:center;">'
         . '<p style="margin:0 0 8px;">' . h($note) . '</p>'
         . '<p style="margin:0;">'
-        . '<a href="' . h($unsubscribeUrl) . '" style="color:#5B2E91;">Unsubscribe</a>'
-        . ' &middot; ' . h(SITE_NAME)
+        . $unsubHtml . h(SITE_NAME)
         . '</p></div>';
 }
 
@@ -101,7 +181,7 @@ function newsletter_build_campaign_html(array $campaign, array $subscriber, bool
     $body .= newsletter_campaign_cta_html($campaign);
 
     $email = normalize_email((string) ($subscriber['email'] ?? ''));
-    $unsub = $email !== '' ? newsletter_unsubscribe_url($email) : site_url('index.php#newsletter');
+    $unsub = $email !== '' ? newsletter_unsubscribe_url($email) : '';
     $body .= newsletter_campaign_footer_html($unsub, $isTest);
 
     $preview = trim((string) ($campaign['preview_text'] ?? ''));
@@ -117,6 +197,40 @@ function newsletter_build_campaign_html(array $campaign, array $subscriber, bool
         . '<tr><td style="background:#ffffff;border-radius:10px;padding:28px 24px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.7;color:#222222;">'
         . $body
         . '</td></tr></table></td></tr></table></body></html>';
+}
+
+function newsletter_send_eligibility(string $email, ?array $cached): array
+{
+    $email = normalize_email($email);
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return ['eligible' => false, 'error' => 'Invalid email address.'];
+    }
+
+    if (!$cached || ($cached['status'] ?? '') !== 'confirmed') {
+        return ['eligible' => false, 'error' => 'No longer a confirmed subscriber.'];
+    }
+
+    if (!newsletter_is_configured()) {
+        return ['eligible' => false, 'error' => 'Could not verify subscriber status with Brevo.'];
+    }
+
+    $live = newsletter_get_contact($email);
+    $httpStatus = (int) ($live['status'] ?? 0);
+
+    if ($httpStatus === 404) {
+        return ['eligible' => false, 'error' => 'Contact is no longer present in Brevo.'];
+    }
+
+    if ($httpStatus !== 200) {
+        return ['eligible' => false, 'error' => 'Could not verify subscriber status with Brevo.'];
+    }
+
+    $body = is_array($live['body'] ?? null) ? $live['body'] : [];
+    if (newsletter_admin_status_from_contact($body) !== 'confirmed') {
+        return ['eligible' => false, 'error' => 'No longer a confirmed subscriber.'];
+    }
+
+    return ['eligible' => true, 'error' => ''];
 }
 
 function newsletter_eligible_recipients(): array
@@ -177,6 +291,16 @@ function newsletter_campaign_validate_for_send(array $campaign): array
     }
     if ($body === '') {
         $errors[] = 'Email content is required before sending.';
+    }
+    if (!newsletter_unsub_secret_configured()) {
+        $errors[] = 'NEWSLETTER_UNSUB_SECRET is not configured.';
+    }
+    if (newsletter_public_base_url() === '') {
+        $errors[] = 'SITE_URL must be a public https origin before sending campaigns.';
+    }
+    $ctaUrl = trim((string) ($campaign['cta_url'] ?? ''));
+    if ($ctaUrl !== '' && !newsletter_is_public_https_url($ctaUrl)) {
+        $errors[] = 'CTA URL must be a public https address before sending.';
     }
 
     $recipients = newsletter_eligible_recipients();
@@ -258,6 +382,11 @@ function newsletter_campaign_update_log(int $id, array $fields): void
 function newsletter_campaign_send_one(array $campaign, array $subscriber, bool $isTest = false): array
 {
     $html = newsletter_build_campaign_html($campaign, $subscriber, $isTest);
+    $unsubUrl = newsletter_unsubscribe_url((string) ($subscriber['email'] ?? ''));
+    if ($unsubUrl === '') {
+        return ['ok' => false, 'error' => 'Cannot generate a secure unsubscribe link.'];
+    }
+
     $subject = (string) ($campaign['subject'] ?? '');
     if ($isTest) {
         $subject = '[TEST] ' . $subject;
@@ -272,7 +401,8 @@ function newsletter_campaign_send_one(array $campaign, array $subscriber, bool $
         $html,
         null,
         $replyTo !== '' ? $replyTo : null,
-        $reason
+        $reason,
+        newsletter_list_unsubscribe_headers((string) ($subscriber['email'] ?? ''), $isTest)
     );
 
     return ['ok' => $ok, 'error' => $ok ? '' : ($reason !== '' ? $reason : 'Send failed.')];
@@ -301,6 +431,12 @@ function newsletter_campaign_send_test(int $campaignId, string $testEmail): arra
     }
     if (!mail_is_configured()) {
         return ['ok' => false, 'error' => 'Email sending is not configured.'];
+    }
+    if (!newsletter_unsub_secret_configured()) {
+        return ['ok' => false, 'error' => 'NEWSLETTER_UNSUB_SECRET is not configured.'];
+    }
+    if (newsletter_public_base_url() === '') {
+        return ['ok' => false, 'error' => 'SITE_URL must be a public https origin before sending campaigns.'];
     }
 
     $cached = newsletter_admin_get_cached_subscriber($testEmail);
@@ -370,7 +506,8 @@ function newsletter_campaign_reset_failed_recipients(int $campaignId): void
 {
     $stmt = db()->prepare(
         "UPDATE newsletter_campaign_recipients
-         SET status = 'pending', error_message = NULL, sent_at = NULL
+         SET status = 'pending', error_message = NULL, sent_at = NULL,
+             claimed_at = NULL, claim_token = NULL
          WHERE campaign_id = ? AND status = 'failed'"
     );
     $stmt->execute([$campaignId]);
@@ -388,12 +525,52 @@ function newsletter_campaign_lock_for_resume(int $campaignId): bool
         $stmt->execute([
             date('Y-m-d H:i:s'),
             $campaignId,
-            date('Y-m-d H:i:s', time() - 600),
+            date('Y-m-d H:i:s', time() - NEWSLETTER_CAMPAIGN_LOCK_SECONDS),
         ]);
         return $stmt->rowCount() === 1;
     } catch (PDOException $e) {
         error_log('newsletter_campaign_lock_for_resume: ' . $e->getMessage());
         return false;
+    }
+}
+
+function newsletter_campaign_touch_lock(int $campaignId): void
+{
+    try {
+        $stmt = db()->prepare(
+            "UPDATE newsletter_campaigns
+             SET locked_at = ?
+             WHERE id = ? AND status = 'sending'"
+        );
+        $stmt->execute([date('Y-m-d H:i:s'), $campaignId]);
+    } catch (PDOException $e) {
+        error_log('newsletter_campaign_touch_lock: ' . $e->getMessage());
+    }
+}
+
+function newsletter_campaign_expire_stale_claims(int $campaignId): int
+{
+    try {
+        $stmt = db()->prepare(
+            "UPDATE newsletter_campaign_recipients
+             SET status = 'unknown',
+                 error_message = ?,
+                 sent_at = NULL,
+                 claim_token = NULL
+             WHERE campaign_id = ?
+               AND status = 'claimed'
+               AND claimed_at IS NOT NULL
+               AND claimed_at < ?"
+        );
+        $stmt->execute([
+            NEWSLETTER_RECIPIENT_UNKNOWN_ERROR,
+            $campaignId,
+            date('Y-m-d H:i:s', time() - NEWSLETTER_RECIPIENT_CLAIM_TTL),
+        ]);
+        return $stmt->rowCount();
+    } catch (PDOException $e) {
+        error_log('newsletter_campaign_expire_stale_claims: ' . $e->getMessage());
+        return 0;
     }
 }
 
@@ -424,20 +601,64 @@ function newsletter_campaign_pending_recipients(int $campaignId): array
     return $stmt->fetchAll() ?: [];
 }
 
-function newsletter_campaign_mark_recipient(int $campaignId, string $email, string $status, string $error = ''): void
+function newsletter_campaign_claim_recipient(int $campaignId, string $email): ?array
 {
+    $email = normalize_email($email);
+    if ($email === '') {
+        return null;
+    }
+
+    $token = bin2hex(random_bytes(16));
+    $now = date('Y-m-d H:i:s');
+
+    try {
+        $stmt = db()->prepare(
+            "UPDATE newsletter_campaign_recipients
+             SET status = 'claimed', claim_token = ?, claimed_at = ?, error_message = NULL, sent_at = NULL
+             WHERE campaign_id = ? AND email = ? AND status = 'pending'"
+        );
+        $stmt->execute([$token, $now, $campaignId, $email]);
+        if ($stmt->rowCount() !== 1) {
+            return null;
+        }
+    } catch (PDOException $e) {
+        error_log('newsletter_campaign_claim_recipient: ' . $e->getMessage());
+        return null;
+    }
+
+    return [
+        'email'        => $email,
+        'claim_token'  => $token,
+        'claimed_at'   => $now,
+    ];
+}
+
+function newsletter_campaign_mark_recipient(
+    int $campaignId,
+    string $email,
+    string $status,
+    string $error = '',
+    string $claimToken = ''
+): bool {
+    if (!in_array($status, ['sent', 'failed'], true) || $claimToken === '') {
+        return false;
+    }
+
     $stmt = db()->prepare(
-        'UPDATE newsletter_campaign_recipients
-         SET status = ?, error_message = ?, sent_at = ?
-         WHERE campaign_id = ? AND email = ?'
+        "UPDATE newsletter_campaign_recipients
+         SET status = ?, error_message = ?, sent_at = ?, claim_token = NULL
+         WHERE campaign_id = ? AND email = ? AND claim_token = ? AND status = 'claimed'"
     );
     $stmt->execute([
         $status,
         $error !== '' ? mb_substr($error, 0, 240) : null,
         $status === 'sent' ? date('Y-m-d H:i:s') : null,
         $campaignId,
-        $email,
+        normalize_email($email),
+        $claimToken,
     ]);
+
+    return $stmt->rowCount() === 1;
 }
 
 function newsletter_campaign_recipient_counts(int $campaignId): array
@@ -447,6 +668,8 @@ function newsletter_campaign_recipient_counts(int $campaignId): array
             SUM(status = 'sent') AS sent_count,
             SUM(status = 'failed') AS failed_count,
             SUM(status = 'pending') AS pending_count,
+            SUM(status = 'claimed') AS claimed_count,
+            SUM(status = 'unknown') AS unknown_count,
             COUNT(*) AS recipient_count
          FROM newsletter_campaign_recipients
          WHERE campaign_id = ?"
@@ -458,6 +681,8 @@ function newsletter_campaign_recipient_counts(int $campaignId): array
         'sent'      => (int) ($row['sent_count'] ?? 0),
         'failed'    => (int) ($row['failed_count'] ?? 0),
         'pending'   => (int) ($row['pending_count'] ?? 0),
+        'claimed'   => (int) ($row['claimed_count'] ?? 0),
+        'unknown'   => (int) ($row['unknown_count'] ?? 0),
         'total'     => (int) ($row['recipient_count'] ?? 0),
     ];
 }
@@ -468,6 +693,9 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
     if (!$campaign) {
         return ['ok' => false, 'error' => 'Campaign not found.'];
     }
+
+    newsletter_campaign_expire_stale_claims($campaignId);
+    newsletter_campaign_touch_lock($campaignId);
 
     $processed = 0;
 
@@ -481,42 +709,65 @@ function newsletter_campaign_process(int $campaignId, int $logId = 0, int $maxRe
             break;
         }
 
+        $claimedAny = false;
         foreach ($batch as $recipient) {
             if ($maxRecipients > 0 && $processed >= $maxRecipients) {
                 break 2;
             }
 
-            $fresh = newsletter_admin_get_cached_subscriber($recipient['email']);
-            if (!$fresh || ($fresh['status'] ?? '') !== 'confirmed') {
-                newsletter_campaign_mark_recipient($campaignId, $recipient['email'], 'failed', 'No longer a confirmed subscriber.');
+            $claim = newsletter_campaign_claim_recipient($campaignId, (string) $recipient['email']);
+            if ($claim === null) {
+                continue;
+            }
+            $claimedAny = true;
+
+            newsletter_campaign_touch_lock($campaignId);
+
+            $fresh = newsletter_admin_get_cached_subscriber($claim['email']);
+            $eligibility = newsletter_send_eligibility($claim['email'], $fresh);
+            if (!$eligibility['eligible']) {
+                newsletter_campaign_mark_recipient(
+                    $campaignId,
+                    $claim['email'],
+                    'failed',
+                    $eligibility['error'] !== '' ? $eligibility['error'] : 'No longer a confirmed subscriber.',
+                    $claim['claim_token']
+                );
                 $processed++;
                 continue;
             }
 
             $result = newsletter_campaign_send_one($campaign, [
-                'email' => $recipient['email'],
+                'email' => $claim['email'],
                 'name'  => (string) ($fresh['name'] ?? $recipient['name'] ?? ''),
             ], false);
 
             if ($result['ok']) {
-                newsletter_campaign_mark_recipient($campaignId, $recipient['email'], 'sent');
+                newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'sent', '', $claim['claim_token']);
             } else {
-                newsletter_campaign_mark_recipient($campaignId, $recipient['email'], 'failed', $result['error']);
+                newsletter_campaign_mark_recipient($campaignId, $claim['email'], 'failed', $result['error'], $claim['claim_token']);
             }
 
             $processed++;
             usleep(50000);
         }
+
+        if (!$claimedAny) {
+            break;
+        }
     }
 
     $row = newsletter_campaign_recipient_counts($campaignId);
-    if ($row['pending'] > 0) {
-        $update = db()->prepare(
-            'UPDATE newsletter_campaigns
-             SET sent_count = ?, failed_count = ?, recipient_count = ?, locked_at = NULL
-             WHERE id = ? AND status = \'sending\''
-        );
-        $update->execute([$row['sent'], $row['failed'], $row['total'], $campaignId]);
+    if ($row['pending'] > 0 || $row['claimed'] > 0) {
+        $lockSql = $row['claimed'] > 0
+            ? 'UPDATE newsletter_campaigns SET sent_count = ?, failed_count = ?, recipient_count = ?, locked_at = ? WHERE id = ? AND status = \'sending\''
+            : 'UPDATE newsletter_campaigns SET sent_count = ?, failed_count = ?, recipient_count = ?, locked_at = NULL WHERE id = ? AND status = \'sending\'';
+        $update = db()->prepare($lockSql);
+        if ($row['claimed'] > 0) {
+            $update->execute([$row['sent'], $row['failed'], $row['total'], date('Y-m-d H:i:s'), $campaignId]);
+        } else {
+            $update->execute([$row['sent'], $row['failed'], $row['total'], $campaignId]);
+        }
 
         if ($logId > 0) {
             newsletter_campaign_update_log($logId, [
@@ -909,9 +1160,9 @@ function newsletter_campaign_analytics(?string $from = null, ?string $to = null)
         $recipients = db()->prepare(
             "SELECT
                 COUNT(*) AS recipients,
-                SUM(r.status = 'sent') AS accepted_sends,
-                SUM(r.status = 'failed') AS failed_sends,
-                SUM(r.status = 'pending') AS pending_sends
+                 SUM(r.status = 'sent') AS accepted_sends,
+                 SUM(r.status = 'failed') AS failed_sends,
+                 SUM(r.status IN ('pending','claimed')) AS pending_sends
              FROM newsletter_campaign_recipients r
              INNER JOIN newsletter_campaigns c ON c.id = r.campaign_id"
             . $recSql
@@ -1033,6 +1284,7 @@ function newsletter_campaign_send_stats(int $campaignId): array
         'pending'    => 0,
         'accepted'   => 0,
         'failed'     => 0,
+        'unknown'    => 0,
         'failures'   => [],
         'logs'       => [],
     ];
@@ -1073,9 +1325,10 @@ function newsletter_campaign_send_stats(int $campaignId): array
 
         return [
             'recipients' => $counts['total'],
-            'pending'    => $counts['pending'],
+            'pending'    => $counts['pending'] + $counts['claimed'],
             'accepted'   => $counts['sent'],
             'failed'     => $counts['failed'],
+            'unknown'    => $counts['unknown'],
             'failures'   => $failures,
             'logs'       => $logStmt->fetchAll() ?: [],
         ];

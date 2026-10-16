@@ -228,6 +228,17 @@ if (!defined('BREVO_NEWSLETTER_LIST_ID')) {
     define('BREVO_NEWSLETTER_LIST_ID', (int) env('BREVO_NEWSLETTER_LIST_ID', 6));
 }
 
+// HMAC secret for public newsletter unsubscribe links. Dedicated key —
+// do not reuse INVOICE_TOKEN_SECRET, ADMIN_2FA_ENCRYPTION_KEY, or SITE_URL.
+// Campaign sending and unsubscribe-token verification fail closed when
+// this is missing or shorter than 16 characters. Generate with:
+//   php -r "echo bin2hex(random_bytes(32));"
+// Never commit the real value. Links signed with the previous
+// SITE_URL / invoice / 2FA fallbacks will no longer verify.
+if (!defined('NEWSLETTER_UNSUB_SECRET')) {
+    define('NEWSLETTER_UNSUB_SECRET', env('NEWSLETTER_UNSUB_SECRET', ''));
+}
+
 
 /* ==========================================
    06C. SECURITY / ADMIN 2FA SETTINGS (Phase 5E)

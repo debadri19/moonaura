@@ -3,8 +3,10 @@
    CLI: SEND DUE NEWSLETTER CAMPAIGNS (Phase 3)
    -------------------------------------------------------------------
    Resumes interrupted sends, then delivers due scheduled campaigns.
-   Confirmed subscribers only. Retry-safe via claim/lock + recipient
-   rows. Does not record open/click analytics.
+    Confirmed subscribers only. Retry-safe via campaign lock, per-
+    recipient claim_token, and recipient rows. Stale claims become
+    unknown and are not auto-retried. Does not record open/click
+    analytics.
 
    Usage:
      php scripts/send-newsletter-campaigns.php

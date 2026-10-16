@@ -30,7 +30,7 @@ $campaign = [
     'reply_to'     => $sender['reply'],
     'body_html'    => '<h2>Hello {{first_name}},</h2><p>Share your latest collection with confirmed subscribers.</p>',
     'cta_text'     => 'Shop Now',
-    'cta_url'      => rtrim((string) SITE_URL, '/') . '/shop.php',
+    'cta_url'      => newsletter_public_base_url() !== '' ? newsletter_public_base_url() . '/shop.php' : '',
     'status'       => 'draft',
 ];
 
@@ -50,6 +50,8 @@ $pageTitle = $isEditing
     : 'Create Campaign';
 
 $sendReady = newsletter_campaign_tables_ready();
+$unsubReady = newsletter_unsub_secret_configured();
+$publicOrigin = newsletter_public_base_url() !== '';
 $recipientCount = $sendReady ? count(newsletter_eligible_recipients()) : 0;
 $sendStats = $isEditing ? newsletter_campaign_send_stats($campaignId) : [
     'recipients' => 0,
@@ -102,7 +104,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($action === 'save') {
-            flash_set('success', 'Campaign draft saved. No emails were sent.');
+            $savedStatus = (string) ($campaign['status'] ?? 'draft');
+            $flash = $savedStatus === 'draft'
+                ? 'Campaign draft saved. No emails were sent.'
+                : 'Campaign saved. Status remains ' . $savedStatus . ' and was not queued for sending.';
+            flash_set('success', $flash);
             redirect('newsletter-campaign-form.php?id=' . $campaignId);
         }
 
@@ -203,6 +209,16 @@ if (!empty($campaign['scheduled_at'])) {
                     </div>
                 <?php endif; ?>
 
+                <?php if (!$unsubReady): ?>
+                    <div class="admin-alert admin-alert-warning">
+                        NEWSLETTER_UNSUB_SECRET is not configured. Test, send, and schedule stay blocked until a dedicated secret is set.
+                    </div>
+                <?php elseif (!$publicOrigin): ?>
+                    <div class="admin-alert admin-alert-warning">
+                        SITE_URL must be a public https origin before this campaign can be sent.
+                    </div>
+                <?php endif; ?>
+
                 <div class="admin-toolbar admin-toolbar-end admin-product-form-toolbar">
                     <a href="newsletter.php" class="admin-btn-secondary">
                         <i class="fa-solid fa-arrow-left"></i>
@@ -235,6 +251,9 @@ if (!empty($campaign['scheduled_at'])) {
                                 </span>
                             </span>
                         </div>
+                        <?php if (in_array($status, ['failed', 'cancelled'], true)): ?>
+                            <p class="admin-field-hint">Saving content keeps this campaign <?= h($status) ?>. It is not queued until you click Send Now or Schedule.</p>
+                        <?php endif; ?>
                         <div class="admin-detail-row">
                             <span>Confirmed recipients</span>
                             <span><?= (int) $recipientCount ?></span>
@@ -364,7 +383,7 @@ if (!empty($campaign['scheduled_at'])) {
                                     name="test_email"
                                     form="newsletter-campaign-form"
                                     value="<?= h($testEmailDefault) ?>"
-                                    <?= $sendReady ? '' : 'disabled' ?>
+                                    <?= ($sendReady && $unsubReady && $publicOrigin) ? '' : 'disabled' ?>
                                 >
                                 <div class="admin-form-actions">
                                     <button
@@ -373,7 +392,7 @@ if (!empty($campaign['scheduled_at'])) {
                                         name="campaign_action"
                                         value="send_test"
                                         class="admin-btn-secondary"
-                                        <?= $sendReady ? '' : 'disabled' ?>
+                                        <?= ($sendReady && $unsubReady && $publicOrigin) ? '' : 'disabled' ?>
                                     >
                                         <i class="fa-solid fa-paper-plane"></i>
                                         Send Test
@@ -390,7 +409,7 @@ if (!empty($campaign['scheduled_at'])) {
                                         value="send_now"
                                         class="admin-btn-primary"
                                         data-send-confirm="Send this campaign now to <?= (int) $recipientCount ?> confirmed subscriber<?= $recipientCount === 1 ? '' : 's' ?>? This cannot be undone."
-                                        <?= ($sendReady && $recipientCount > 0) ? '' : 'disabled' ?>
+                                        <?= ($sendReady && $unsubReady && $publicOrigin && $recipientCount > 0) ? '' : 'disabled' ?>
                                     >
                                         <i class="fa-solid fa-bolt"></i>
                                         Send Now
@@ -407,7 +426,7 @@ if (!empty($campaign['scheduled_at'])) {
                                     form="newsletter-campaign-form"
                                     min="<?= h($minSchedule) ?>"
                                     value="<?= h($scheduleValue) ?>"
-                                    <?= ($sendReady && $recipientCount > 0) ? '' : 'disabled' ?>
+                                    <?= ($sendReady && $unsubReady && $publicOrigin && $recipientCount > 0) ? '' : 'disabled' ?>
                                 >
                                 <p class="admin-field-hint">Uses server time. Run scripts/send-newsletter-campaigns.php from cron to deliver due campaigns.</p>
                                 <div class="admin-form-actions">
@@ -417,7 +436,7 @@ if (!empty($campaign['scheduled_at'])) {
                                         name="campaign_action"
                                         value="schedule"
                                         class="admin-btn-secondary"
-                                        <?= ($sendReady && $recipientCount > 0) ? '' : 'disabled' ?>
+                                        <?= ($sendReady && $unsubReady && $publicOrigin && $recipientCount > 0) ? '' : 'disabled' ?>
                                     >
                                         <i class="fa-solid fa-clock"></i>
                                         Schedule

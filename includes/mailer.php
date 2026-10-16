@@ -125,15 +125,19 @@ function html_to_text(string $html): string
                  to MAIL_FROM_ADDRESS if that is empty too) - so order
                  emails reply to support@ by default while the From
                  stays the no-reply sender.
-   $failureReason - optional by-ref out-param that receives the failure
-                 reason string when the send fails (empty on success).
+    $failureReason - optional by-ref out-param that receives the failure
+                  reason string when the send fails (empty on success).
+    $extraHeaders - optional header name => value map (e.g. List-Unsubscribe
+                  on newsletter campaigns). Names must be token-safe;
+                  values must not contain CR/LF. Transactional callers
+                  omit this and are unchanged.
 
-   Returns true on success, false on ANY failure (never throws). On
-   failure the exact PHPMailer error is written to error_log for ops
-   to diagnose - the caller only sees "false".
+    Returns true on success, false on ANY failure (never throws). On
+    failure the exact PHPMailer error is written to error_log for ops
+    to diagnose - the caller only sees "false".
 ========================================== */
 
-function send_email(?string $toAddress, string $toName = '', string $subject = '', string $htmlBody = '', ?string $textBody = null, ?string $replyToAddress = null, ?string &$failureReason = null): bool
+function send_email(?string $toAddress, string $toName = '', string $subject = '', string $htmlBody = '', ?string $textBody = null, ?string $replyToAddress = null, ?string &$failureReason = null, array $extraHeaders = []): bool
 {
     $failureReason = null;
     $toAddress = normalize_email((string) $toAddress);
@@ -191,6 +195,21 @@ function send_email(?string $toAddress, string $toName = '', string $subject = '
         $mail->addReplyTo($replyTo, MAIL_FROM_NAME);
 
         $mail->addAddress($toAddress, $toName);
+
+        foreach ($extraHeaders as $headerName => $headerValue) {
+            $headerName = trim((string) $headerName);
+            $headerValue = trim((string) $headerValue);
+            if ($headerName === '' || $headerValue === '') {
+                continue;
+            }
+            if (!preg_match('/^[A-Za-z0-9-]+$/', $headerName)) {
+                continue;
+            }
+            if (preg_match('/[\r\n]/', $headerValue)) {
+                continue;
+            }
+            $mail->addCustomHeader($headerName, $headerValue);
+        }
 
         $mail->Subject = $subject;
         $mail->isHTML(true);

@@ -966,13 +966,16 @@ CREATE TABLE newsletter_campaign_recipients (
     campaign_id         INT UNSIGNED    NOT NULL,
     email               VARCHAR(190)    NOT NULL,
     name                VARCHAR(160)    NULL,
-    status              ENUM('pending','sent','failed') NOT NULL DEFAULT 'pending',
+    status              ENUM('pending','claimed','sent','failed','unknown') NOT NULL DEFAULT 'pending',
     error_message       VARCHAR(255)    NULL,
     sent_at             DATETIME        NULL,
+    claimed_at          DATETIME        NULL,
+    claim_token         CHAR(32)        NULL,
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     UNIQUE KEY uq_newsletter_campaign_recipient (campaign_id, email),
-    INDEX idx_newsletter_recipients_status (campaign_id, status)
+    INDEX idx_newsletter_recipients_status (campaign_id, status),
+    INDEX idx_newsletter_recipients_claim (campaign_id, status, claimed_at)
 
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

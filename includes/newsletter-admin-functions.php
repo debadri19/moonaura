@@ -5,6 +5,10 @@
    Builds Admin subscriber management and campaign drafts on top of
    the existing Brevo Contacts integration. Does not send campaigns.
    Storefront signup (newsletter_subscribe) is unchanged.
+   Sync loads pending and confirmed lists and honors emailBlacklisted.
+   Cached addresses missing from both lists are stored as unsubscribed
+   so a remote blacklist/unlink cannot keep them campaign-eligible.
+   Never writes to the customers table.
 =================================================================== */
 
 require_once __DIR__ . '/newsletter-functions.php';
@@ -104,7 +108,7 @@ function newsletter_campaign_tables_ready(): bool
     try {
         db()->query('SELECT scheduled_at, locked_at FROM newsletter_campaigns LIMIT 1');
         db()->query('SELECT id FROM newsletter_campaign_sends LIMIT 1');
-        db()->query('SELECT id FROM newsletter_campaign_recipients LIMIT 1');
+        db()->query('SELECT id, claimed_at, claim_token FROM newsletter_campaign_recipients LIMIT 1');
         $ready = true;
     } catch (PDOException $e) {
         error_log('newsletter_campaign_tables_ready: ' . $e->getMessage());
@@ -271,7 +275,7 @@ function newsletter_admin_sync_from_brevo(): array
     $merged = [];
 
     foreach ($pending['contacts'] as $contact) {
-        $row = newsletter_admin_row_from_contact($contact, 'pending');
+        $row = newsletter_admin_row_from_contact($contact);
         if ($row['email'] === '' || !filter_var($row['email'], FILTER_VALIDATE_EMAIL)) {
             continue;
         }
@@ -279,15 +283,21 @@ function newsletter_admin_sync_from_brevo(): array
     }
 
     foreach ($confirmed['contacts'] as $contact) {
-        $row = newsletter_admin_row_from_contact($contact, 'confirmed');
+        $row = newsletter_admin_row_from_contact($contact);
         if ($row['email'] === '' || !filter_var($row['email'], FILTER_VALIDATE_EMAIL)) {
+            continue;
+        }
+        if (($row['status'] ?? '') === 'pending' && isset($merged[$row['email']])) {
             continue;
         }
         $merged[$row['email']] = $row;
     }
 
     try {
-        $existingStmt = db()->query('SELECT email, status, source FROM newsletter_subscribers');
+        $existingStmt = db()->query(
+            'SELECT email, name, status, source, brevo_id, subscribed_at, confirmed_at, unsubscribed_at
+             FROM newsletter_subscribers'
+        );
         $existingRows = $existingStmt->fetchAll() ?: [];
     } catch (PDOException $e) {
         error_log('newsletter_admin_sync_from_brevo existing: ' . $e->getMessage());
@@ -295,26 +305,25 @@ function newsletter_admin_sync_from_brevo(): array
         return ['ok' => false, 'error' => 'Could not read the local subscriber cache.', 'count' => 0];
     }
 
+    $now = date('Y-m-d H:i:s');
     foreach ($existingRows as $existing) {
         $email = normalize_email((string) ($existing['email'] ?? ''));
         if ($email === '' || isset($merged[$email])) {
             continue;
         }
 
-        if (($existing['status'] ?? '') === 'unsubscribed') {
-            $merged[$email] = [
-                'email'            => $email,
-                'name'             => '',
-                'status'           => 'unsubscribed',
-                'source'           => (string) ($existing['source'] ?: 'brevo'),
-                'brevo_id'         => null,
-                'subscribed_at'    => null,
-                'confirmed_at'     => null,
-                'unsubscribed_at'  => date('Y-m-d H:i:s'),
-                'last_modified_at' => date('Y-m-d H:i:s'),
-                'synced_at'        => date('Y-m-d H:i:s'),
-            ];
-        }
+        $merged[$email] = [
+            'email'            => $email,
+            'name'             => (string) ($existing['name'] ?? ''),
+            'status'           => 'unsubscribed',
+            'source'           => (string) ($existing['source'] ?: 'brevo'),
+            'brevo_id'         => $existing['brevo_id'] ?? null,
+            'subscribed_at'    => $existing['subscribed_at'] ?? null,
+            'confirmed_at'     => $existing['confirmed_at'] ?? null,
+            'unsubscribed_at'  => $existing['unsubscribed_at'] ?: $now,
+            'last_modified_at' => $now,
+            'synced_at'        => $now,
+        ];
     }
 
     try {
@@ -673,15 +682,301 @@ function newsletter_admin_configured_sender(): array
     ];
 }
 
+function newsletter_is_public_ip(string $ip): bool
+{
+    $ip = strtolower(trim($ip));
+    $ip = trim($ip, '[]');
+    if ($ip === '') {
+        return false;
+    }
+    if (preg_match('/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/', $ip, $mapped)) {
+        return newsletter_is_public_ip($mapped[1]);
+    }
+    if (preg_match('/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i', $ip, $mapped)) {
+        $hi = hexdec($mapped[1]);
+        $lo = hexdec($mapped[2]);
+        return newsletter_is_public_ip(
+            (($hi >> 8) & 255) . '.' . ($hi & 255) . '.' . (($lo >> 8) & 255) . '.' . ($lo & 255)
+        );
+    }
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+        return false;
+    }
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $long = ip2long($ip);
+        if ($long === false) {
+            return false;
+        }
+        $unsigned = sprintf('%u', $long);
+        // FILTER_FLAG_NO_RES_RANGE does not cover CGNAT (100.64.0.0/10,
+        // RFC 6598) or multicast (224.0.0.0/4, RFC 5771); reject both.
+        foreach ([
+            ['100.64.0.0', '100.127.255.255'],
+            ['224.0.0.0', '239.255.255.255'],
+        ] as $range) {
+            if ($unsigned >= sprintf('%u', ip2long($range[0]))
+                && $unsigned <= sprintf('%u', ip2long($range[1]))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    $packed = @inet_pton($ip);
+    if ($packed === false || ord($packed[0]) === 0xff) {
+        // Reject IPv6 multicast ff00::/8, also uncovered by NO_RES_RANGE.
+        return false;
+    }
+
+    return true;
+}
+
+function newsletter_is_public_host(string $host): bool
+{
+    $host = strtolower(trim($host));
+    $host = trim($host, '[]');
+    $host = rtrim($host, '.');
+    if ($host === '' || strlen($host) > 253) {
+        return false;
+    }
+    if ($host === 'localhost' || str_ends_with($host, '.localhost')) {
+        return false;
+    }
+
+    foreach (['.internal', '.local', '.lan', '.home', '.corp', '.invalid', '.onion'] as $suffix) {
+        if ($host === ltrim($suffix, '.') || str_ends_with($host, $suffix)) {
+            return false;
+        }
+    }
+
+    if (strpbrk($host, " \t\r\n/%\\@") !== false) {
+        return false;
+    }
+    if (preg_match('/^\d+$/', $host) || preg_match('/^0x[0-9a-f]+$/i', $host)) {
+        return false;
+    }
+    if (filter_var($host, FILTER_VALIDATE_IP) || str_contains($host, ':')) {
+        return newsletter_is_public_ip($host);
+    }
+    if (!str_contains($host, '.')) {
+        return false;
+    }
+    if (!preg_match('/^(xn--)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.(xn--)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i', $host)) {
+        return false;
+    }
+
+    return true;
+}
+
+function newsletter_is_public_https_url(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '' || strlen($url) > 2048) {
+        return false;
+    }
+    if (preg_match('/[\x00-\x1f\x7f]/', $url)) {
+        return false;
+    }
+
+    $compact = strtolower(preg_replace('/\s+/', '', $url) ?? '');
+    $compact = html_entity_decode($compact, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    foreach (['javascript:', 'vbscript:', 'data:', 'file:', 'about:'] as $scheme) {
+        if (str_starts_with($compact, $scheme)) {
+            return false;
+        }
+    }
+    if (!preg_match('#^https://#i', $url)) {
+        return false;
+    }
+
+    $parts = parse_url($url);
+    if (!is_array($parts)) {
+        return false;
+    }
+    if (strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+        return false;
+    }
+    if (isset($parts['user']) || isset($parts['pass'])) {
+        return false;
+    }
+
+    $host = (string) ($parts['host'] ?? '');
+    if ($host === '' || !newsletter_is_public_host($host)) {
+        return false;
+    }
+    if (array_key_exists('port', $parts) && (int) $parts['port'] !== 443) {
+        return false;
+    }
+
+    return true;
+}
+
+function newsletter_campaign_allowed_html(): array
+{
+    return [
+        'p'      => [],
+        'h1'     => [],
+        'h2'     => [],
+        'h3'     => [],
+        'strong' => [],
+        'b'      => [],
+        'em'     => [],
+        'i'      => [],
+        'u'      => [],
+        'ul'     => [],
+        'ol'     => [],
+        'li'     => [],
+        'br'     => [],
+        'span'   => [],
+        'div'    => [],
+        'a'      => ['href', 'title'],
+        'img'    => ['src', 'alt', 'width', 'height'],
+    ];
+}
+
+function newsletter_sanitize_dom_element(DOMElement $element, array $allowed): void
+{
+    if ($element->parentNode === null) {
+        return;
+    }
+
+    $tag = strtolower($element->tagName);
+    $drop = [
+        'script', 'style', 'iframe', 'object', 'embed', 'link', 'meta',
+        'noscript', 'svg', 'math', 'form', 'input', 'button', 'textarea',
+        'select', 'base', 'applet',
+    ];
+    if (in_array($tag, $drop, true)) {
+        $element->parentNode->removeChild($element);
+        return;
+    }
+
+    if (!isset($allowed[$tag])) {
+        $parent = $element->parentNode;
+        while ($element->firstChild) {
+            $parent->insertBefore($element->firstChild, $element);
+        }
+        $parent->removeChild($element);
+        return;
+    }
+
+    $keep = $allowed[$tag];
+    $remove = [];
+    if ($element->hasAttributes()) {
+        foreach ($element->attributes as $attribute) {
+            $name = strtolower($attribute->name);
+            if (!in_array($name, $keep, true)) {
+                $remove[] = $attribute->name;
+            }
+        }
+    }
+    foreach ($remove as $name) {
+        $element->removeAttribute($name);
+    }
+
+    if ($tag === 'a') {
+        $href = trim($element->getAttribute('href'));
+        if ($href === '' || !newsletter_is_public_https_url($href)) {
+            $parent = $element->parentNode;
+            while ($element->firstChild) {
+                $parent->insertBefore($element->firstChild, $element);
+            }
+            $parent->removeChild($element);
+            return;
+        }
+        $element->setAttribute('href', $href);
+        $title = trim($element->getAttribute('title'));
+        if ($title !== '') {
+            $element->setAttribute('title', mb_substr($title, 0, 200));
+        }
+    }
+
+    if ($tag === 'img') {
+        $src = trim($element->getAttribute('src'));
+        if ($src === '' || !newsletter_is_public_https_url($src)) {
+            $element->parentNode->removeChild($element);
+            return;
+        }
+        $element->setAttribute('src', $src);
+        $element->setAttribute('alt', mb_substr(trim($element->getAttribute('alt')), 0, 200));
+        foreach (['width', 'height'] as $dimension) {
+            $value = $element->getAttribute($dimension);
+            if ($value !== '' && !preg_match('/^\d{1,4}$/', $value)) {
+                $element->removeAttribute($dimension);
+            }
+        }
+    }
+}
+
+function newsletter_sanitize_dom_children(DOMNode $parent, array $allowed): void
+{
+    foreach (iterator_to_array($parent->childNodes) as $child) {
+        if ($child instanceof DOMElement) {
+            newsletter_sanitize_dom_children($child, $allowed);
+            newsletter_sanitize_dom_element($child, $allowed);
+            continue;
+        }
+        if ($child->nodeType === XML_TEXT_NODE) {
+            continue;
+        }
+        if ($child->nodeType === XML_CDATA_SECTION_NODE && $parent instanceof DOMElement) {
+            $parent->replaceChild($parent->ownerDocument->createTextNode((string) $child->nodeValue), $child);
+            continue;
+        }
+        $parent->removeChild($child);
+    }
+}
+
 function newsletter_sanitize_campaign_html(string $html): string
 {
-    $allowed = '<p><h1><h2><h3><strong><b><em><i><u><a><ul><ol><li><br><img><span><div>';
-    $html = strip_tags($html, $allowed);
-    $html = preg_replace('/\son[a-z]+\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)/i', '', $html ?? '') ?? '';
-    $html = preg_replace('/javascript\s*:/i', '', $html) ?? '';
-    $html = preg_replace('/data\s*:/i', '', $html) ?? '';
+    $html = trim($html);
+    if ($html === '') {
+        return '';
+    }
+    if (!class_exists('DOMDocument')) {
+        error_log('newsletter_sanitize_campaign_html: DOMDocument is unavailable');
+        return '';
+    }
 
-    return trim($html);
+    $previous = libxml_use_internal_errors(true);
+    $document = new DOMDocument('1.0', 'UTF-8');
+    $wrapped = '<div id="nws-root">' . $html . '</div>';
+    $loaded = $document->loadHTML(
+        '<?xml encoding="UTF-8"><body>' . $wrapped . '</body>',
+        LIBXML_NONET | LIBXML_HTML_NODEFDTD
+    );
+    libxml_clear_errors();
+    libxml_use_internal_errors($previous);
+    if (!$loaded) {
+        return '';
+    }
+
+    $root = $document->getElementById('nws-root');
+    if (!$root) {
+        foreach ($document->getElementsByTagName('div') as $div) {
+            if ($div->getAttribute('id') === 'nws-root') {
+                $root = $div;
+                break;
+            }
+        }
+    }
+    if (!$root) {
+        return '';
+    }
+
+    $allowed = newsletter_campaign_allowed_html();
+    newsletter_sanitize_dom_children($root, $allowed);
+
+    $output = '';
+    foreach (iterator_to_array($root->childNodes) as $child) {
+        $output .= $document->saveHTML($child);
+    }
+
+    return trim($output);
 }
 
 function newsletter_apply_personalization(string $html, array $subscriber = []): string
@@ -760,12 +1055,8 @@ function newsletter_admin_save_campaign(array $data, ?int $id = null): array
         return ['ok' => false, 'id' => 0, 'error' => 'Reply-To must be a valid email address.'];
     }
 
-    if ($ctaUrl !== '' && !preg_match('#^https?://#i', $ctaUrl)) {
-        return ['ok' => false, 'id' => 0, 'error' => 'CTA URL must start with http:// or https://.'];
-    }
-
-    if ($ctaUrl !== '' && !filter_var($ctaUrl, FILTER_VALIDATE_URL)) {
-        return ['ok' => false, 'id' => 0, 'error' => 'CTA URL is not valid.'];
+    if ($ctaUrl !== '' && !newsletter_is_public_https_url($ctaUrl)) {
+        return ['ok' => false, 'id' => 0, 'error' => 'CTA URL must be a public https address without credentials or private hosts.'];
     }
 
     try {
@@ -782,7 +1073,7 @@ function newsletter_admin_save_campaign(array $data, ?int $id = null): array
             $stmt = db()->prepare(
                 'UPDATE newsletter_campaigns
                  SET name = ?, subject = ?, preview_text = ?, sender_name = ?, sender_email = ?,
-                     reply_to = ?, body_html = ?, cta_text = ?, cta_url = ?, status = \'draft\'
+                     reply_to = ?, body_html = ?, cta_text = ?, cta_url = ?
                  WHERE id = ? AND status IN (\'draft\',\'failed\',\'cancelled\')'
             );
             $stmt->execute([

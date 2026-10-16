@@ -153,6 +153,8 @@ $campaignStats  = newsletter_campaign_analytics($from, $to);
 $configured     = newsletter_is_configured();
 $tablesReady    = newsletter_admin_ensure_tables();
 $sendReady      = newsletter_campaign_tables_ready();
+$unsubReady     = newsletter_unsub_secret_configured();
+$publicOrigin   = newsletter_public_base_url() !== '';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -199,6 +201,16 @@ $sendReady      = newsletter_campaign_tables_ready();
                 <?php if (!$configured): ?>
                     <div class="admin-alert admin-alert-warning">
                         Brevo newsletter integration is not configured. Subscriber actions will fail until it is set up.
+                    </div>
+                <?php endif; ?>
+
+                <?php if (!$unsubReady): ?>
+                    <div class="admin-alert admin-alert-warning">
+                        NEWSLETTER_UNSUB_SECRET is not configured. Campaign sending and public unsubscribe links are disabled until a dedicated secret of at least 16 characters is set in the environment.
+                    </div>
+                <?php elseif (!$publicOrigin): ?>
+                    <div class="admin-alert admin-alert-warning">
+                        SITE_URL must be a public https origin before campaign emails can include a secure unsubscribe link.
                     </div>
                 <?php endif; ?>
 

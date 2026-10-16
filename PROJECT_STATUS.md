@@ -132,7 +132,7 @@ These are **not claimed resolved** by this documentation pass:
 
 1. Full-site visual QA not signed off.
 2. Production env completeness (Razorpay live keys, Brevo SMTP, `ADMIN_2FA_ENCRYPTION_KEY`, `INVOICE_TOKEN_SECRET`, GA4/Pixel IDs) must be confirmed on the live host — not inferred from this workspace.
-3. Newsletter campaign live sending, cron, and migration application must be confirmed on the host.
+3. Newsletter campaign live sending, cron, and migration application must be confirmed on the host. Set `NEWSLETTER_UNSUB_SECRET` (16+ characters) and a public https `SITE_URL` before any send. Apply `database/migration_newsletter_recipient_claims.sql` after the Phase 3 sending migration. Previous unsubscribe links signed with `SITE_URL` / invoice / 2FA fallbacks will not verify.
 4. Open/click/bounce tracking is not configured.
 5. Unpublished working-tree UI is not committed.
 
@@ -157,14 +157,15 @@ Before calling the storefront production-ready:
 
 ## Database Migrations
 
-Canonical order remains `DEPLOYMENT_CHECKLIST.md` §1 (12 files). Fresh install: `database/schema.sql` + `database/seed.sql`.
+Canonical order remains `DEPLOYMENT_CHECKLIST.md` §1 (15 files). Fresh install: `database/schema.sql` + `database/seed.sql`.
 
 Newsletter Admin (manual, execution Unknown in this workspace):
 
 1. `database/migration_newsletter_admin.sql` — Phase 1/2 tables.
 2. `database/migration_newsletter_campaign_sending.sql` — Phase 3 send columns/tables.
+3. `database/migration_newsletter_recipient_claims.sql` — recipient `claimed`/`unknown` statuses plus `claimed_at`/`claim_token` for exclusive worker claims. Apply after 2.
 
-Phase 4 added **no** new SQL. Existing DBs must apply the two files above in order if not already applied.
+Phase 4 added **no** new SQL. `newsletter_campaign_tables_ready()` selects `claimed_at`/`claim_token`, so campaign send/test/schedule stay blocked until 3 is applied on existing databases.
 
 ---
 

@@ -53,10 +53,19 @@ idempotent; safe to re-run; a fresh install can instead load
 14. `database/migration_newsletter_campaign_sending.sql` — campaign
       send/schedule columns plus `newsletter_campaign_sends` and
       `newsletter_campaign_recipients` (Phase 3). Apply after 13.
-      Re-running ALTER statements may error if columns already exist.
+      Repeat-safe via `information_schema` column/index guards.
+      Preflight: `SHOW COLUMNS FROM newsletter_campaigns LIKE 'locked_at'`
+      and `SHOW TABLES LIKE 'newsletter_campaign_recipients'`.
+      Execution in this workspace: **No — not executed**.
+15. `database/migration_newsletter_recipient_claims.sql` — recipient
+      `claimed`/`unknown` statuses plus `claimed_at`/`claim_token`
+      (campaign worker exclusive claim). Apply after 14.
+      Repeat-safe via `information_schema` column/index guards.
+      Preflight: `SHOW COLUMNS FROM newsletter_campaign_recipients LIKE 'claim_token'`.
+      Execution in this workspace: **No — not executed**.
 
 Phase 4 campaign analytics added **no** new SQL. Fresh installs get
-these tables from `database/schema.sql`. Execution of 13–14 in this
+these tables from `database/schema.sql`. Execution of 13–15 in this
 workspace: Unknown (not run here).
 
 > **Warning:** migration 6 must be applied before 2FA is enabled, or the
@@ -111,7 +120,8 @@ workspace: Unknown (not run here).
 | `BREVO_SMTP_SECURE` | no | `auto` (default) / `tls` / `ssl` / `none` |
 | `MAIL_FROM_ADDRESS` | yes (for email) | e.g. `no-reply@yourdomain.example` |
 | `MAIL_FROM_NAME` | no | defaults to `SITE_NAME` |
-| `MAIL_REPLY_TO_ADDRESS` | no | Reply-To for order/reset emails; defaults to `support@moonauracrystals.in` |
+| `MAIL_REPLY_TO_ADDRESS` | no | Reply-To for order/reset emails; defaults to `support@moonauracrystals.in`. Also used as the `List-Unsubscribe` mailto address when valid |
+| `NEWSLETTER_UNSUB_SECRET` | yes (for newsletter campaigns) | Dedicated HMAC secret, 16+ characters. `php -r "echo bin2hex(random_bytes(32));"`. Campaign send/test/schedule fail closed without it. Do not reuse invoice/2FA secrets |
 | Invoice settings | yes | Per `SETUP.md` (invoice number format, GST, store details) |
 | Payment gateway keys | yes | Razorpay credentials + webhook setup (see `SETUP.md`). COD is active. Cashfree/PhonePe are not in use. |
 
@@ -157,6 +167,7 @@ workspace: Unknown (not run here).
   reader; confirm the per-line GST Rate column, Taxable Value and
   CGST/SGST/IGST rows match the order's stored snapshot
 - [ ] `.env` contains a valid `ADMIN_2FA_ENCRYPTION_KEY` (32-byte base64) — **not** the dev value used locally
+- [ ] `.env` contains `NEWSLETTER_UNSUB_SECRET` (16+ characters, dedicated HMAC secret). Campaign send/test/schedule fail closed without it. Existing unsubscribe links signed with the old SITE_URL / invoice / 2FA fallbacks will not verify.
 - [ ] Brevo SMTP credentials configured; send a test password-reset email to confirm delivery
 - [ ] Confirm `MAIL_REPLY_TO_ADDRESS` (default `support@moonauracrystals.in`) resolves to a monitored inbox — it is the Reply-To on all order emails
 - [ ] Place a COD test order and a gateway test order; confirm the confirmation email arrives exactly once per order

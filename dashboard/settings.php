@@ -395,6 +395,7 @@ $successMessage = flash_get('success');
                     $mailFromName = defined('MAIL_FROM_NAME') ? (string) MAIL_FROM_NAME : '';
                     $mailReplyTo = defined('MAIL_REPLY_TO_ADDRESS') ? (string) MAIL_REPLY_TO_ADDRESS : '';
                     $smtpReady = function_exists('mail_is_configured') ? mail_is_configured() : ($smtpHost !== '' && $mailFromAddress !== '');
+                    $newsletterUnsubConfigured = defined('NEWSLETTER_UNSUB_SECRET') && is_string(NEWSLETTER_UNSUB_SECRET) && strlen(NEWSLETTER_UNSUB_SECRET) >= 16;
 
                     $whatsappNumber = '919242319596';
                     $whatsappConfigured = $whatsappNumber !== '';
@@ -430,6 +431,10 @@ $successMessage = flash_get('success');
                         <div class="admin-detail-row">
                             <span>Final List ID</span>
                             <span><?= $brevoFinalListId > 0 ? (int) $brevoFinalListId : 'Not Configured' ?></span>
+                        </div>
+                        <div class="admin-detail-row">
+                            <span>Unsubscribe Secret</span>
+                            <span><?= $newsletterUnsubConfigured ? 'Configured' : 'Not Configured' ?></span>
                         </div>
                     </div>
 

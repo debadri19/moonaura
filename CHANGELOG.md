@@ -61,6 +61,32 @@ product version bump. Visual QA and live campaign testing pending.
 - Test emails are counted separately and excluded from recipient totals.
 - **No new SQL migration.** Reuses Phase 1–3 tables.
 
+### Newsletter remaining-gap hardening (unreleased)
+
+- Public unsubscribe HMAC uses dedicated `NEWSLETTER_UNSUB_SECRET` only.
+  Missing/short secrets fail closed. Invoice/2FA/`SITE_URL` fallbacks removed.
+  Previously signed links will not verify after this change.
+- Campaign send/test/schedule require a public `https` `SITE_URL` so
+  unsubscribe URLs are never built from localhost.
+- Campaign HTML includes `List-Unsubscribe` (https + mailto). One-click
+  `List-Unsubscribe-Post` is not added because the public endpoint still
+  requires an interactive CSRF confirmation.
+- Sync: contacts on pending/confirmed lists still use live Brevo status
+  (including `emailBlacklisted`). Cached rows missing from both lists are
+  stored as unsubscribed. Send-time eligibility re-checks Brevo and skips
+  the recipient when the API fails.
+- Saving a failed/cancelled campaign no longer resets status to draft.
+- Phase 3 SQL uses `information_schema` guards. **No — not executed**.
+- `.gitignore` conflict markers removed.
+- Campaign HTML sanitizer uses DOMDocument allowlists; event handlers,
+  `style`, and non-https image/link URLs are dropped.
+- CTA and `SITE_URL` require public https (no localhost, loopback,
+  private, link-local, `.internal`, or embedded credentials).
+- Workers claim each recipient atomically (`claimed` + `claim_token`)
+  before SMTP. Stale claims become `unknown` and are not auto-retried.
+  Migration: `database/migration_newsletter_recipient_claims.sql`.
+  **No — not executed**.
+
 ### Newsletter Phases 1–3 (already in working tree)
 
 - Phase 1: subscriber cache, search/filter/CSV, add (DOI), unsubscribe.
@@ -71,6 +97,7 @@ product version bump. Visual QA and live campaign testing pending.
 **SQL (manual, not executed here):**
 - `database/migration_newsletter_admin.sql`
 - `database/migration_newsletter_campaign_sending.sql`
+- `database/migration_newsletter_recipient_claims.sql`
 - Fresh installs: `database/schema.sql` already includes these tables.
 
 ---

@@ -1,0 +1,111 @@
+MoonAura Crystals - Phase 6A QA Transfer (2026-10-16, unsubscribe token tests)
+============================================================================
+
+Export date: 2026-10-16
+Source repository: debadri19/moonaura  (https://github.com/debadri19/moonaura.git)
+Source branch: main
+Source HEAD: 658b69d89b8e4c54c2e1365915ab553fe0881e69
+Local merge commit: 287e89417e38d6d2cb3ec60f0f66521f301aa420
+Newsletter security commit: 658b69d89b8e4c54c2e1365915ab553fe0881e69
+
+This package supersedes MoonAura_Newsletter_Phase6_QA_Transfer_2026-10-16.zip.
+It adds a behavioral test suite for the unsubscribe HMAC token functions and
+updates the runtime QA guide (all uncommitted):
+
+  NEW: tests/newsletter_unsubscribe_tokens.php
+       Behavioral tests for newsletter_unsubscribe_token() /
+       newsletter_verify_unsubscribe_token() / newsletter_public_base_url() /
+       newsletter_unsubscribe_url(). Covers valid tokens, changed email,
+       tampered sig/exp, expired, malformed/missing, weak/missing secret
+       (fail closed), legacy SITE_URL / invoice / 2FA-derived signatures
+       rejected, and a non-public SITE_URL yielding no usable URL.
+       Config values are immutable constants, so each configuration runs in
+       a child PHP process (requires proc_open). If children cannot spawn it
+       prints BLOCKED (exit 2); each scenario can be run alone with
+       NLQA_MODE=valid|weak|missing|local.
+
+  DOC: tests/NEWSLETTER_RUNTIME_QA.md
+       Section 5 now references the automated token suite and marks the
+       DB/email-dependent cases (GET/POST workflow, CSRF 403, List-Unsubscribe
+       headers) as integration-only.
+
+The Phase 6 multicast fix from the previous package is still present in this
+working tree:
+
+  FIX: newsletter_is_public_ip() rejects IPv4 multicast (224.0.0.0/4) and
+       IPv6 multicast (ff00::/8). File: includes/newsletter-admin-functions.php
+       Regression cases: tests/newsletter_security_fixes.php
+
+Package contents
+----------------
+This ZIP is the current working tree of the source repository (not a
+`git archive`, not a Git clone). It therefore INCLUDES changes that were
+UNCOMMITTED at export time:
+
+  - includes/newsletter-admin-functions.php   (modified, uncommitted)
+  - tests/newsletter_security_fixes.php       (modified, uncommitted)
+  - PROJECT_STATUS.md                          (modified, uncommitted)
+  - tests/NEWSLETTER_RUNTIME_QA.md             (new, untracked)
+  - tests/newsletter_unsubscribe_tokens.php    (new, untracked)
+
+Excluded from this ZIP
+----------------------
+  - .git/ history (this is not a clone)
+  - .env / .env.* / config.local.php (none existed in the source clone)
+  - vendor/ and node_modules/
+  - Database dumps, personal/customer data, runtime caches, logs,
+    temporary files, and other generated artifacts
+  - Nested ZIP/backup archives
+
+Status and honesty notes
+------------------------
+  - Runtime PHP/MySQL tests have NOT passed. PHP CLI and MySQL are
+    unavailable in the MC environment, so every PHP test (lint and
+    behavioral) is BLOCKED there. The multicast fix and the new token suite
+    are verified by source review only, and must be confirmed by running the
+    tests on the Windows PHP runtime.
+  - NO database migrations were executed.
+  - NO email was sent and NO Brevo call was made.
+  - At the time of this ZIP export, GitHub `main` had not been updated
+    with the source clone's local commits. The current Windows repository
+    is publishing these code changes as a new commit on its own main history.
+  - This is a TEST TRANSFER PACKAGE for local QA. It is NOT a
+    runtime-verified production release.
+
+How to use this package (Windows / Laragon)
+-------------------------------------------
+1. Extract this ZIP into a SEPARATE directory, for example:
+
+       C:\laragon\www\Moonaura_QA
+
+   Do NOT overwrite or replace the existing
+   C:\laragon\www\Moonaura folder.
+
+2. Run the non-DB tests first (Laragon terminal):
+
+       php -l tests/newsletter_unsubscribe_tokens.php
+       php tests/newsletter_security_fixes.php
+       php tests/newsletter_hardening.php
+       php tests/newsletter_unsubscribe_tokens.php
+
+   Expected: all PASS, exit code 0. The "multicast is rejected" case and the
+   unsubscribe-token cases should pass.
+
+3. Follow QA_WINDOWS_TESTING.md for the safe database/email ordering.
+4. See tests/NEWSLETTER_RUNTIME_QA.md for full procedures.
+
+Git history note
+----------------
+This ZIP excludes .git. The commit hashes above describe the source
+clone at export time and are informational references, not proof that
+those commits exist in the recipient repository's history.
+The code and tests are being published from the Windows working tree
+as a new commit based on its current main branch.
+
+Recent source commits
+---------------------
+  658b69d  Harden newsletter security and recipient claims
+  287e894  Merge origin/main to reconcile admin UI history
+  067fafb  Admin UI Fix                       (origin/main)
+  eadacf2  Fix admin settings layout and newsletter spacing
+  8a829d7  Newsletter Phase 4

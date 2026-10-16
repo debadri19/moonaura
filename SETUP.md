@@ -504,3 +504,19 @@ Details:
   (`ADMIN_SESSION_IDLE_TIMEOUT`), User-Agent session binding, security
   headers (nosniff / SAMEORIGIN / Referrer-Policy), and logout is now
   POST + CSRF only.
+
+## 10. Newsletter Unsubscribe Secret
+
+Campaign send, test, schedule, and public unsubscribe HMAC tokens require a dedicated secret. Without it they fail closed.
+
+```
+NEWSLETTER_UNSUB_SECRET=<hex of 32 random bytes, 16+ characters>
+```
+
+Generate one with:
+
+```
+php -r "echo bin2hex(random_bytes(32));"
+```
+
+Do not reuse `INVOICE_TOKEN_SECRET`, `ADMIN_2FA_ENCRYPTION_KEY`, or derive a key from `SITE_URL`. Links signed with those previous fallbacks will no longer verify; subscribers need a new campaign email or support help. `SITE_URL` and campaign CTA URLs must be public `https` origins. Localhost, loopback, private, link-local, `.internal`, and URLs with embedded credentials are rejected. Unsubscribe URLs and `List-Unsubscribe` headers are not built from an insecure fallback. Local drafts can still be saved without a public origin; send/test/schedule stay blocked until `SITE_URL` is a public https origin.

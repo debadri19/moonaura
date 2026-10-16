@@ -4,24 +4,98 @@
 -- Adds send/schedule fields to newsletter_campaigns and a send-history
 -- table. Does not change customers, orders, or storefront newsletter
 -- signup tables. Apply after database/migration_newsletter_admin.sql.
--- Re-running ALTER statements may error if columns already exist.
+-- Repeat-safe on MySQL 5.7+ / MariaDB 10+ via information_schema
+-- guards. CREATE TABLE IF NOT EXISTS statements below are idempotent.
+-- MODIFY ENUM is safe to re-run with the same values.
+-- Do not execute this file from this workspace without an explicit
+-- host-side request. Execution status for this task: No — not executed.
 -- ===================================================================
 
 ALTER TABLE newsletter_campaigns
     MODIFY status ENUM('draft','scheduled','sending','sent','failed','cancelled') NOT NULL DEFAULT 'draft';
 
-ALTER TABLE newsletter_campaigns
-    ADD COLUMN scheduled_at DATETIME NULL AFTER status,
-    ADD COLUMN started_at DATETIME NULL AFTER scheduled_at,
-    ADD COLUMN completed_at DATETIME NULL AFTER started_at,
-    ADD COLUMN recipient_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER completed_at,
-    ADD COLUMN sent_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER recipient_count,
-    ADD COLUMN failed_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER sent_count,
-    ADD COLUMN failure_reason VARCHAR(255) NULL AFTER failed_count,
-    ADD COLUMN locked_at DATETIME NULL AFTER failure_reason;
+SET @db := DATABASE();
 
-ALTER TABLE newsletter_campaigns
-    ADD INDEX idx_newsletter_campaigns_scheduled (status, scheduled_at);
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'scheduled_at') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN scheduled_at DATETIME NULL AFTER status',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'started_at') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN started_at DATETIME NULL AFTER scheduled_at',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'completed_at') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN completed_at DATETIME NULL AFTER started_at',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'recipient_count') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN recipient_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER completed_at',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'sent_count') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN sent_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER recipient_count',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'failed_count') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN failed_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER sent_count',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'failure_reason') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN failure_reason VARCHAR(255) NULL AFTER failed_count',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND COLUMN_NAME = 'locked_at') = 0,
+    'ALTER TABLE newsletter_campaigns ADD COLUMN locked_at DATETIME NULL AFTER failure_reason',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(
+    (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'newsletter_campaigns' AND INDEX_NAME = 'idx_newsletter_campaigns_scheduled') = 0,
+    'ALTER TABLE newsletter_campaigns ADD INDEX idx_newsletter_campaigns_scheduled (status, scheduled_at)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 
 CREATE TABLE IF NOT EXISTS newsletter_campaign_sends (
