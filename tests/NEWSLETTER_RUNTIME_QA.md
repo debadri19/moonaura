@@ -409,3 +409,28 @@ Do not execute now.
 - Migrations 13–15 have not been executed; `newsletter_campaign_tables_ready()`
   requires the claim columns, so sending stays blocked until 15 is applied.
 - No live preview was produced for this phase.
+
+## Local Windows QA Results - 2026-10-24
+
+Environment:
+- PHP 8.3.33
+- MySQL 8.4.3
+- Windows / Laragon
+
+Passed:
+- Newsletter hardening and security checks
+- Unsubscribe token validation
+- List-Unsubscribe header construction (helper-level only)
+- Recipient result-failure: 37 passed, 0 failed
+- Public unsubscribe HTTP checks
+- MySQL recipient-claim concurrency checks on the fresh schema
+- Pre-claim schema upgraded using migration_newsletter_recipient_claims.sql
+- Migration rerun completed without SQL errors
+- Recipient-claim concurrency checks passed after migration
+
+Not tested or still blocked:
+- Actual SMTP header delivery to a mailbox
+- Successful remote Brevo unsubscribe
+- Hosted staging validation
+- HTTP unsubscribe database-state verification
+- Full production email delivery workflow
